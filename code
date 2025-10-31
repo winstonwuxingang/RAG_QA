@@ -1,0 +1,217 @@
+```本项目是：基于大模型RAG技术的问答式检索系统。
+作者：wuxingang_ncl@qq.com
+@2025.10.25
+本项目：以Python实现，包括数据预处理、RAG检索、答案生成和简单的Web接口四个部分 。
+供小白学习参考【高手请忽略】 。 
+```
+
+```1.数据预处理模块
+1.1 安装依赖
+首先，确保安装了所有必要的依赖库：```
+pip install langchain text2vec chromadb ffmpeg-python paddleocr fastapi uvicorn
+
+"""1.2 数据预处理代码"""
+
+
+import os
+import ffmpeg
+import paddleocr
+from langchain.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from text2vec import SentenceModel, cos_sim
+from chromadb.api import Collection
+from chromadb.api.types import Embedding
+from chromadb.config import Settings
+from chromadb.api import Client
+import numpy as np
+
+# 初始化Chroma客户端
+client = Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
+
+# 初始化文本嵌入模型
+model = SentenceModel("shibing624/text2vec-base-chinese")
+
+# 初始化OCR工具
+ocr = paddleocr.OCR(use_angle_cls=True, lang="ch")
+
+def load_and_split_documents(file_path):
+    """加载文档并切分"""
+    loader = TextLoader(file_path)
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    texts = text_splitter.split_documents(documents)
+    return texts
+
+def vectorize_texts(texts):
+    """将文本块转换为向量"""
+    embeddings = model.encode(texts)
+    return embeddings
+
+def save_to_chroma(collection_name, embeddings, metadatas):
+    """将向量和元数据存入Chroma"""
+    collection = client.get_or_create_collection(name=collection_name, metadata_schema={"source": "string", "page": "int"})
+    collection.add(embeddings=embeddings, metadatas=metadatas)
+    return collection
+
+def process_video(file_path, collection_name):
+    """处理视频文件"""
+    # 提取视频帧
+    frames = ffmpeg.input(file_path)
+    frames = ffmpeg.output(frames, "frame_%04d.png", r=1)
+    ffmpeg.run(frames)
+
+    # 提取文字
+    texts = []
+    for frame_file in os.listdir("."):
+        if frame_file.startswith("frame_"):
+            result = ocr.ocr(frame_file, cls=True)
+            for line in result:
+                texts.append(line[-1][0])
+
+    # 向量化并存入Chroma
+    embeddings = vectorize_texts(texts)
+    metadatas = [{"source": file_path, "page": i} for i in range(len(texts))]
+    save_to_chroma(collection_name, embeddings, metadatas)
+
+# 举个栗子：处理文档
+texts = load_and_split_documents("戚继光诗词大全.txt")
+embeddings = vectorize_texts([text.page_content for text in texts])
+metadatas = [{"source": "example.txt", "page": i} for i in range(len(texts))]
+save_to_chroma("my_collection", embeddings, metadatas)
+
+#  举个栗子：处理视频
+process_video("example.mp4", "my_collection")
+
+
+```
+2.RAG检索模块
+2.1 RAG检索代码
+```
+def encode_query(query):
+    """将用户问题编码为向量"""
+    return model.encode([query])[0]
+
+def similarity_search(collection_name, query_embedding, top_k=5):
+    """在向量数据库中进行相似度搜索"""
+    collection = client.get_collection(collection_name)
+    results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+    return results
+
+def rerank_results(results, query):
+    """对初检结果进行重排序"""
+    # 这里可以引入更复杂的模型进行重排序
+    # 本项目组的实现：就不告诉你（暂时保密、因为要发一篇新论文），这里直接返回原始结果
+    return results
+
+def rag_retrieval(collection_name, query, top_k=5):
+    """RAG检索流程"""
+    query_embedding = encode_query(query)
+    results = similarity_search(collection_name, query_embedding, top_k)
+    reranked_results = rerank_results(results, query)
+    return reranked_results
+
+
+```
+3.提示工程与答案生成模块
+3.1 提示工程与答案生成代码
+```
+
+from langchain.llms import ChatGLM3
+
+# 初始化ChatGLM3模型
+llm = ChatGLM3()
+
+def generate_prompt(context, query):
+    """构建Prompt"""
+    prompt_template = f"你是一位关于戚继光生平的知识库问答助手。请根据以下上下文回答问题：\n\n{context}\n\n问题：{query}\n答案："
+    return prompt_template
+
+def generate_answer(prompt):
+    """调用大模型生成答案"""
+    response = llm(prompt)
+    return response
+
+def answer_question(collection_name, query, top_k=5):
+    """回答问题"""
+    results = rag_retrieval(collection_name, query, top_k)
+    context = "\n".join([result["metadata"]["text"] for result in results])
+    prompt = generate_prompt(context, query)
+    answer = generate_answer(prompt)
+    return answer
+
+
+```
+4.Web接口
+4.1 FastAPI Web接口代码
+```
+
+
+from fastapi import FastAPI, File, UploadFile
+from pydantic import BaseModel
+from typing import List
+
+app = FastAPI()
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...)):
+    """上传文件并处理"""
+    file_path = f"./uploads/{file.filename}"
+    with open(file_path, "wb") as f:
+        f.write(file.file.read())
+    if file.filename.endswith(".mp4"):
+        process_video(file_path, "my_collection")
+    else:
+        texts = load_and_split_documents(file_path)
+        embeddings = vectorize_texts([text.page_content for text in texts])
+        metadatas = [{"source": file_path, "page": i} for i in range(len(texts))]
+        save_to_chroma("my_collection", embeddings, metadatas)
+    return {"message": "File uploaded and processed successfully"}
+
+@app.post("/query/")
+async def query(request: QueryRequest):
+    """查询问题并获取答案"""
+    answer = answer_question("my_collection", request.query, request.top_k)
+    return {"answer": answer}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+```
+5.运行系统
+ 启动FastAPI服务器：
+```
+
+   uvicorn main:app --reload  #bash
+
+
+
+ #访问主路径：  http://127.0.0.1:8000/   。
+
+```
+6.使用示例
+• 上传文件：
+```
+
+  curl -X 'POST' \
+    'http://127.0.0.1:8000/upload/' \
+    -H 'Content-Type: multipart/form-data' \
+    -F 'file=@戚继光生平.txt'
+  
+
+```
+• 查询问题：
+``` 
+  curl -X 'POST' \
+    'http://127.0.0.1:8000/query/' \
+    -H 'Content-Type: application/json' \
+    -d '{
+    "query": "这是一个问题",
+    "top_k": 5
+  }'
+  
